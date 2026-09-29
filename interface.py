@@ -9,7 +9,7 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 st.set_page_config(page_title="islam chatboot",page_icon="🐉")
-st.title("🤖 welcome to my chatboot")
+st.title("🤖 welcome to  chatboot")
 
 # Historique de la conversation
 if "messages" not in st.session_state:
