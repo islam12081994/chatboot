@@ -6,6 +6,7 @@ from openai import OpenAI
 
 import auth
 import db
+import rag
 
 load_dotenv()
 client = OpenAI(
@@ -13,6 +14,11 @@ client = OpenAI(
     base_url="https://api.groq.com/openai/v1",
 )
 MODEL = "openai/gpt-oss-120b"
+MODEL_VOC = "whisper-large-v3"
+
+# Les 2 modes que l'utilisateur peut choisir
+MODE_TEXTE = "💬 Texte (GPT OSS 120B)"
+MODE_VOCAL = "🎤 Vocal (Whisper large v3)"
 
 st.set_page_config(page_title="islam chatboot", page_icon="🐉")
 
@@ -73,6 +79,29 @@ if "user_id" not in st.session_state:
 
 user_id = st.session_state.user_id
 
+
+def afficher_message(contenu):
+    """Affiche du texte (ou une ancienne image si le message commence par IMAGE:)"""
+    if contenu.startswith("IMAGE:"):
+        chemin = contenu[len("IMAGE:"):]
+        if os.path.exists(chemin):
+            st.image(chemin)
+        else:
+            st.write("🖼️ (image introuvable)")
+    else:
+        st.write(contenu)
+
+
+def transcrire(audio_file) -> str:
+    """Transforme l'enregistrement du micro en texte avec Whisper (Groq)."""
+    resultat = client.audio.transcriptions.create(
+        model=MODEL_VOC,
+        file=("audio.wav", audio_file.getvalue()),
+        # language="fr",  # décommente pour forcer le français
+    )
+    return resultat.text.strip()
+
+
 # =====================================================================
 # 2) CHATBOT (utilisateur connecté)
 # =====================================================================
@@ -83,15 +112,24 @@ if "conv_id" not in st.session_state:
     convs = db.list_conversations(user_id)
     st.session_state.conv_id = convs[0]["id"] if convs else db.create_conversation(user_id)
 
+# Compteur pour vider l'enregistreur audio après chaque envoi
+if "audio_n" not in st.session_state:
+    st.session_state.audio_n = 0
+
 # --- Barre latérale ---
 with st.sidebar:
     st.title("💬 Assistant RAG")
     st.caption(f"👤 Connecté : **{st.session_state.username}**")
 
     if st.button("🚪 Se déconnecter", use_container_width=True):
-        for cle in ["user_id", "username", "conv_id", "editing_id"]:
+        for cle in ["user_id", "username", "conv_id", "editing_id", "fichiers_ajoutes"]:
             st.session_state.pop(cle, None)
         st.rerun()
+
+    st.divider()
+
+    # --- Choix du mode ---
+    mode = st.radio("🧠 Mode", [MODE_TEXTE, MODE_VOCAL])
 
     st.divider()
 
@@ -153,8 +191,23 @@ with st.sidebar:
         type=["pdf", "txt"],
         accept_multiple_files=True,
     )
-    if fichiers:
-        st.success(f"{len(fichiers)} document(s) chargé(s)")
+    # Ajouter les fichiers dans ChromaDB (une seule fois par fichier)
+    if "fichiers_ajoutes" not in st.session_state:
+        st.session_state.fichiers_ajoutes = []
+    for fichier in fichiers or []:
+        if fichier.name not in st.session_state.fichiers_ajoutes:
+            with st.spinner(f"Lecture de {fichier.name}..."):
+                nb = rag.ajouter_document(user_id, fichier)
+            st.session_state.fichiers_ajoutes.append(fichier.name)
+            st.success(f"{fichier.name} : {nb} morceaux ajoutés")
+
+    nb_total = rag.nombre_morceaux(user_id)
+    if nb_total > 0:
+        st.info(f"📚 {nb_total} morceaux dans ta base")
+        if st.button("🗑 Vider mes documents", use_container_width=True):
+            rag.supprimer_documents(user_id)
+            st.session_state.fichiers_ajoutes = []
+            st.rerun()
     else:
         st.info("Aucun document chargé")
 
@@ -164,10 +217,31 @@ messages = db.get_messages(conv_id)
 
 for msg in messages:
     with st.chat_message(msg["role"]):
-        st.write(msg["content"])
+        afficher_message(msg["content"])
 
-# --- Zone pour écrire la question ---
+# --- Zone pour écrire (ou dire) la question ---
 question = st.chat_input("Écris ta question ici...")
+
+if mode == MODE_VOCAL:
+    audio = st.audio_input(
+        "🎤 Clique sur le micro, parle, puis arrête l'enregistrement",
+        key=f"audio_{st.session_state.audio_n}",
+    )
+    if audio is not None and not question:
+        erreur = False
+        with st.spinner("Transcription de ta voix..."):
+            try:
+                texte = transcrire(audio)
+            except Exception as e:
+                texte = ""
+                erreur = True
+                st.error(f"⚠️ Erreur de transcription : {e}")
+        # On vide l'enregistreur pour ne pas retraiter le même audio
+        st.session_state.audio_n += 1
+        if texte:
+            question = texte
+        elif not erreur:
+            st.warning("Je n'ai rien entendu, réessaie.")
 
 if question:
     # Le titre de la conversation = début de la première question
@@ -179,16 +253,36 @@ if question:
         st.write(question)
 
     with st.chat_message("assistant"):
+        # ---------- Modèle TEXTE (Groq + RAG) ----------
         with st.spinner("Réflexion..."):
             try:
+                # On remplace les anciennes images de l'historique par un petit texte
+                historique = []
+                for m in db.get_messages(conv_id):
+                    if m["content"].startswith("IMAGE:"):
+                        historique.append({"role": m["role"], "content": "[image générée]"})
+                    else:
+                        historique.append(m)
+
+                # RAG : on cherche les morceaux utiles dans les documents
+                morceaux = rag.chercher(user_id, question)
+                if morceaux:
+                    contexte = "\n\n".join(morceaux)
+                    systeme = {
+                        "role": "system",
+                        "content": "Réponds en utilisant ces extraits de documents "
+                        "si c'est utile :\n\n" + contexte,
+                    }
+                    historique = [systeme] + historique
+
                 response = client.chat.completions.create(
                     model=MODEL,
-                    messages=db.get_messages(conv_id),
+                    messages=historique,
                 )
                 answer = response.choices[0].message.content
             except Exception as e:
                 answer = f"⚠️ Erreur lors de l'appel à l'API : {e}"
-            st.write(answer)
+        afficher_message(answer)
 
     db.add_message(conv_id, "assistant", answer)
     st.rerun()
