@@ -1,8 +1,13 @@
+import base64
+import io
 import os
+import re
+import uuid
 
 import streamlit as st
 from dotenv import load_dotenv
 from openai import OpenAI
+from PIL import Image
 
 import auth
 import db
@@ -15,10 +20,14 @@ client = OpenAI(
 )
 MODEL = "openai/gpt-oss-120b"
 MODEL_VOC = "whisper-large-v3"
+# Modèle de vision (lecture d'images). Tu peux aussi essayer "qwen/qwen3.8-27b"
+MODEL_VISION = "qwen/qwen3.8-27b"
+DOSSIER_IMAGES = "images_envoyees"
 
-# Les 2 modes que l'utilisateur peut choisir
+# Les 3 modes que l'utilisateur peut choisir
 MODE_TEXTE = "💬 Texte (GPT OSS 120B)"
 MODE_VOCAL = "🎤 Vocal (Whisper large v3)"
+MODE_VISION = "🖼️ Vision (Qwen 3.6 27B)"
 
 st.set_page_config(page_title="islam chatboot", page_icon="🐉")
 
@@ -81,13 +90,17 @@ user_id = st.session_state.user_id
 
 
 def afficher_message(contenu):
-    """Affiche du texte (ou une ancienne image si le message commence par IMAGE:)"""
+    """Affiche du texte. Si le message commence par IMAGE:chemin, affiche aussi l'image
+    (le texte éventuel est placé après le premier retour à la ligne)."""
     if contenu.startswith("IMAGE:"):
-        chemin = contenu[len("IMAGE:"):]
+        premiere_ligne, _, texte = contenu.partition("\n")
+        chemin = premiere_ligne[len("IMAGE:"):]
         if os.path.exists(chemin):
             st.image(chemin)
         else:
             st.write("🖼️ (image introuvable)")
+        if texte:
+            st.write(texte)
     else:
         st.write(contenu)
 
@@ -100,6 +113,53 @@ def transcrire(audio_file) -> str:
         # language="fr",  # décommente pour forcer le français
     )
     return resultat.text.strip()
+
+
+def preparer_image(source) -> bytes:
+    """Ouvre l'image, la réduit (1568 px max) et la convertit en JPEG
+    pour rester sous la limite de taille de l'API."""
+    img = Image.open(source).convert("RGB")
+    img.thumbnail((1568, 1568))
+    tampon = io.BytesIO()
+    img.save(tampon, format="JPEG", quality=85)
+    return tampon.getvalue()
+
+
+def sauvegarder_image(data: bytes) -> str:
+    """Enregistre l'image sur le disque et retourne son chemin."""
+    os.makedirs(DOSSIER_IMAGES, exist_ok=True)
+    chemin = os.path.join(DOSSIER_IMAGES, f"{uuid.uuid4().hex}.jpg")
+    with open(chemin, "wb") as f:
+        f.write(data)
+    return chemin
+
+
+def derniere_image(liste_messages):
+    """Retourne les octets de la dernière image envoyée par l'utilisateur dans la conversation."""
+    for m in reversed(liste_messages):
+        if m["role"] == "user" and m["content"].startswith("IMAGE:"):
+            chemin = m["content"].partition("\n")[0][len("IMAGE:"):]
+            if os.path.exists(chemin):
+                with open(chemin, "rb") as f:
+                    return f.read()
+    return None
+
+
+def convertir_historique(liste_messages):
+    """Remplace les images de l'historique par un petit texte (pour les modèles texte)."""
+    resultat = []
+    for m in liste_messages:
+        contenu = m["content"]
+        if contenu.startswith("IMAGE:"):
+            _, _, texte = contenu.partition("\n")
+            contenu = "[image jointe] " + texte if texte else "[image jointe]"
+        resultat.append({"role": m["role"], "content": contenu})
+    return resultat
+
+
+def nettoyer_reponse(texte: str) -> str:
+    """Retire un éventuel bloc <think>...</think> (raisonnement) de la réponse."""
+    return re.sub(r"<think>.*?</think>", "", texte or "", flags=re.DOTALL).strip()
 
 
 # =====================================================================
@@ -116,6 +176,10 @@ if "conv_id" not in st.session_state:
 if "audio_n" not in st.session_state:
     st.session_state.audio_n = 0
 
+# Compteur pour vider le champ d'import d'image après chaque envoi
+if "img_n" not in st.session_state:
+    st.session_state.img_n = 0
+
 # --- Barre latérale ---
 with st.sidebar:
     st.title("💬 Assistant RAG")
@@ -129,7 +193,7 @@ with st.sidebar:
     st.divider()
 
     # --- Choix du mode ---
-    mode = st.radio("🧠 Mode", [MODE_TEXTE, MODE_VOCAL])
+    mode = st.radio("🧠 Mode", [MODE_TEXTE, MODE_VOCAL, MODE_VISION])
 
     st.divider()
 
@@ -243,46 +307,92 @@ if mode == MODE_VOCAL:
         elif not erreur:
             st.warning("Je n'ai rien entendu, réessaie.")
 
+# --- Mode VISION : import d'une image à analyser ---
+image_data = None
+nouvelle_image = False
+
+if mode == MODE_VISION:
+    fichier_image = st.file_uploader(
+        "🖼️ Image à analyser (png, jpg, webp)",
+        type=["png", "jpg", "jpeg", "webp"],
+        key=f"img_{st.session_state.img_n}",
+    )
+    if question:
+        if fichier_image is not None:
+            try:
+                image_data = preparer_image(fichier_image)
+                nouvelle_image = True
+            except Exception as e:
+                st.error(f"⚠️ Image illisible : {e}")
+                question = None
+        else:
+            # Pas de nouvelle image : on réutilise la dernière de la conversation
+            image_data = derniere_image(messages)
+            if image_data is None:
+                st.warning("Importe d'abord une image à analyser.")
+                question = None
+
 if question:
     # Le titre de la conversation = début de la première question
     if not messages:
         db.rename_conversation(conv_id, question[:40], user_id)
 
-    db.add_message(conv_id, "user", question)
+    contenu_user = question
+    if nouvelle_image:
+        contenu_user = f"IMAGE:{sauvegarder_image(image_data)}\n{question}"
+
+    db.add_message(conv_id, "user", contenu_user)
     with st.chat_message("user"):
-        st.write(question)
+        afficher_message(contenu_user)
 
     with st.chat_message("assistant"):
-        # ---------- Modèle TEXTE (Groq + RAG) ----------
-        with st.spinner("Réflexion..."):
-            try:
-                # On remplace les anciennes images de l'historique par un petit texte
-                historique = []
-                for m in db.get_messages(conv_id):
-                    if m["content"].startswith("IMAGE:"):
-                        historique.append({"role": m["role"], "content": "[image générée]"})
-                    else:
-                        historique.append(m)
+        if mode == MODE_VISION:
+            # ---------- Modèle VISION (Groq + Qwen) ----------
+            with st.spinner("Analyse de l'image..."):
+                try:
+                    historique = convertir_historique(messages)
+                    url_image = "data:image/jpeg;base64," + base64.b64encode(image_data).decode()
+                    historique.append({
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": question},
+                            {"type": "image_url", "image_url": {"url": url_image}},
+                        ],
+                    })
+                    response = client.chat.completions.create(
+                        model=MODEL_VISION,
+                        messages=historique,
+                    )
+                    answer = nettoyer_reponse(response.choices[0].message.content)
+                except Exception as e:
+                    answer = f"⚠️ Erreur lors de l'analyse de l'image : {e}"
+        else:
+            # ---------- Modèle TEXTE (Groq + RAG) ----------
+            with st.spinner("Réflexion..."):
+                try:
+                    historique = convertir_historique(db.get_messages(conv_id))
 
-                # RAG : on cherche les morceaux utiles dans les documents
-                morceaux = rag.chercher(user_id, question)
-                if morceaux:
-                    contexte = "\n\n".join(morceaux)
-                    systeme = {
-                        "role": "system",
-                        "content": "Réponds en utilisant ces extraits de documents "
-                        "si c'est utile :\n\n" + contexte,
-                    }
-                    historique = [systeme] + historique
+                    # RAG : on cherche les morceaux utiles dans les documents
+                    morceaux = rag.chercher(user_id, question)
+                    if morceaux:
+                        contexte = "\n\n".join(morceaux)
+                        systeme = {
+                            "role": "system",
+                            "content": "Réponds en utilisant ces extraits de documents "
+                            "si c'est utile :\n\n" + contexte,
+                        }
+                        historique = [systeme] + historique
 
-                response = client.chat.completions.create(
-                    model=MODEL,
-                    messages=historique,
-                )
-                answer = response.choices[0].message.content
-            except Exception as e:
-                answer = f"⚠️ Erreur lors de l'appel à l'API : {e}"
+                    response = client.chat.completions.create(
+                        model=MODEL,
+                        messages=historique,
+                    )
+                    answer = response.choices[0].message.content
+                except Exception as e:
+                    answer = f"⚠️ Erreur lors de l'appel à l'API : {e}"
         afficher_message(answer)
 
     db.add_message(conv_id, "assistant", answer)
+    if nouvelle_image:
+        st.session_state.img_n += 1  # vide le champ d'import d'image
     st.rerun()
