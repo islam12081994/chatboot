@@ -1,3 +1,7 @@
 streamlit
 openai
 python-dotenv
+bcrypt
+chromadb
+huggingface_hub
+pypdf
