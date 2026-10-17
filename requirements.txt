@@ -6,3 +6,4 @@ chromadb
 huggingface_hub
 pypdf
 sentence_transformers
+google-genai

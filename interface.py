@@ -162,15 +162,73 @@ def nettoyer_reponse(texte: str) -> str:
     return re.sub(r"<think>.*?</think>", "", texte or "", flags=re.DOTALL).strip()
 
 
+def ligne_conversation(conv, cle):
+    """Affiche une conversation dans la barre latérale : titre | ✏️ | 🗑
+    (ou le mode édition du titre)."""
+    est_active = conv["id"] == st.session_state.conv_id
+
+    if st.session_state.get("editing_id") == conv["id"]:
+        nouveau_titre = st.text_input(
+            "Nouveau titre",
+            value=conv["title"],
+            max_chars=60,
+            key=f"input_{cle}_{conv['id']}",
+        )
+        c1, c2 = st.columns(2)
+        if c1.button("✅ Enregistrer", key=f"save_{cle}_{conv['id']}", use_container_width=True):
+            if nouveau_titre.strip():
+                db.rename_conversation(conv["id"], nouveau_titre.strip(), user_id)
+                st.session_state.editing_id = None
+                st.rerun()
+            else:
+                st.warning("Le titre ne peut pas être vide.")
+        if c2.button("❌ Annuler", key=f"cancel_{cle}_{conv['id']}", use_container_width=True):
+            st.session_state.editing_id = None
+            st.rerun()
+    else:
+        col1, col2, col3 = st.columns([5, 1, 1])
+        if col1.button(
+            conv["title"],
+            key=f"open_{cle}_{conv['id']}",
+            use_container_width=True,
+            type="primary" if est_active else "secondary",
+        ):
+            st.session_state.conv_id = conv["id"]
+            st.rerun()
+        if col2.button("✏️", key=f"edit_{cle}_{conv['id']}"):
+            st.session_state.editing_id = conv["id"]
+            st.rerun()
+        if col3.button("🗑", key=f"del_{cle}_{conv['id']}"):
+            db.delete_conversation(conv["id"], user_id)
+            if est_active:
+                restantes = db.list_conversations(user_id)
+                st.session_state.conv_id = (
+                    restantes[0]["id"] if restantes else db.create_conversation(user_id)
+                )
+            st.rerun()
+
+
 # =====================================================================
 # 2) CHATBOT (utilisateur connecté)
 # =====================================================================
 st.title("🤖 welcome to chatboot")
 
 # --- Conversation courante ---
-if "conv_id" not in st.session_state:
-    convs = db.list_conversations(user_id)
-    st.session_state.conv_id = convs[0]["id"] if convs else db.create_conversation(user_id)
+toutes_convs = db.list_conversations(user_id)
+if "conv_id" not in st.session_state or not any(
+    c["id"] == st.session_state.conv_id for c in toutes_convs
+):
+    st.session_state.conv_id = (
+        toutes_convs[0]["id"] if toutes_convs else db.create_conversation(user_id)
+    )
+    toutes_convs = db.list_conversations(user_id)
+
+projets = db.list_projects(user_id)
+conv_actuelle = next(c for c in toutes_convs if c["id"] == st.session_state.conv_id)
+projet_id = conv_actuelle["project_id"]  # None = conversation générale
+projet_nom = next((p["name"] for p in projets if p["id"] == projet_id), None)
+if projet_id is not None and projet_nom is None:
+    projet_id = None  # projet introuvable : on traite comme une conversation générale
 
 # Compteur pour vider l'enregistreur audio après chaque envoi
 if "audio_n" not in st.session_state:
@@ -201,79 +259,99 @@ with st.sidebar:
         st.session_state.conv_id = db.create_conversation(user_id)
         st.rerun()
 
-    st.subheader("🕘 Historique")
-    for conv in db.list_conversations(user_id):
-        est_active = conv["id"] == st.session_state.conv_id
+    # ---------------- Projets ----------------
+    st.subheader("📁 Projets")
+    with st.expander("➕ Créer un projet"):
+        with st.form("form_projet", clear_on_submit=True):
+            nom_projet = st.text_input("Nom du projet", max_chars=40)
+            creer_projet = st.form_submit_button("Créer", use_container_width=True)
+        if creer_projet:
+            if nom_projet.strip():
+                nouveau_projet = db.create_project(user_id, nom_projet.strip())
+                # On ouvre directement une première conversation dans ce projet
+                st.session_state.conv_id = db.create_conversation(
+                    user_id, project_id=nouveau_projet
+                )
+                st.rerun()
+            else:
+                st.warning("Donne un nom au projet.")
 
-        if st.session_state.get("editing_id") == conv["id"]:
-            # Mode édition : champ de texte + Enregistrer / Annuler
-            nouveau_titre = st.text_input(
-                "Nouveau titre",
-                value=conv["title"],
-                max_chars=60,
-                key=f"input_{conv['id']}",
-            )
-            c1, c2 = st.columns(2)
-            if c1.button("✅ Enregistrer", key=f"save_{conv['id']}", use_container_width=True):
-                if nouveau_titre.strip():
-                    db.rename_conversation(conv["id"], nouveau_titre.strip(), user_id)
-                    st.session_state.editing_id = None
-                    st.rerun()
-                else:
-                    st.warning("Le titre ne peut pas être vide.")
-            if c2.button("❌ Annuler", key=f"cancel_{conv['id']}", use_container_width=True):
-                st.session_state.editing_id = None
-                st.rerun()
-        else:
-            # Mode normal : titre | ✏️ | 🗑
-            col1, col2, col3 = st.columns([5, 1, 1])
-            if col1.button(
-                conv["title"],
-                key=f"open_{conv['id']}",
+    if not projets:
+        st.caption("Aucun projet pour l'instant.")
+    for projet in projets:
+        convs_projet = [c for c in toutes_convs if c["project_id"] == projet["id"]]
+        actif = projet["id"] == projet_id
+        with st.expander(
+            f"{'➡️ ' if actif else ''}📁 {projet['name']} ({len(convs_projet)})",
+            expanded=actif,
+        ):
+            if st.button(
+                "➕ Nouvelle conversation ici",
+                key=f"newconv_p{projet['id']}",
                 use_container_width=True,
-                type="primary" if est_active else "secondary",
             ):
-                st.session_state.conv_id = conv["id"]
+                st.session_state.conv_id = db.create_conversation(
+                    user_id, project_id=projet["id"]
+                )
                 st.rerun()
-            if col2.button("✏️", key=f"edit_{conv['id']}"):
-                st.session_state.editing_id = conv["id"]
+            for conv in convs_projet:
+                ligne_conversation(conv, f"p{projet['id']}")
+            if st.button(
+                "🗑 Supprimer ce projet",
+                key=f"delproj_{projet['id']}",
+                use_container_width=True,
+            ):
+                db.delete_project(projet["id"], user_id)
+                rag.supprimer_documents(user_id, projet["id"])
+                st.session_state.fichiers_ajoutes = []
                 st.rerun()
-            if col3.button("🗑", key=f"del_{conv['id']}"):
-                db.delete_conversation(conv["id"], user_id)
-                if conv["id"] == st.session_state.conv_id:
-                    convs = db.list_conversations(user_id)
-                    st.session_state.conv_id = (
-                        convs[0]["id"] if convs else db.create_conversation(user_id)
-                    )
-                st.rerun()
+
+    # ---------------- Conversations générales ----------------
+    st.subheader("🕘 Conversations générales")
+    convs_generales = [c for c in toutes_convs if c["project_id"] is None]
+    if not convs_generales:
+        st.caption("Aucune conversation hors projet.")
+    for conv in convs_generales:
+        ligne_conversation(conv, "g")
 
     st.divider()
 
-    st.subheader("📁 Documents")
+    # ---------------- Documents (du projet courant ou généraux) ----------------
+    portee = f"projet « {projet_nom} »" if projet_id else "conversations générales"
+    st.subheader("📄 Documents")
+    st.caption(f"Portée : {portee}")
     fichiers = st.file_uploader(
         "Importer un fichier",
         type=["pdf", "txt"],
         accept_multiple_files=True,
+        key=f"uploader_{projet_id or 'general'}",
     )
-    # Ajouter les fichiers dans ChromaDB (une seule fois par fichier)
+    # Ajouter les fichiers dans ChromaDB (une seule fois par fichier et par portée)
     if "fichiers_ajoutes" not in st.session_state:
         st.session_state.fichiers_ajoutes = []
     for fichier in fichiers or []:
-        if fichier.name not in st.session_state.fichiers_ajoutes:
+        cle_fichier = f"{projet_id or 'general'}:{fichier.name}"
+        if cle_fichier not in st.session_state.fichiers_ajoutes:
             with st.spinner(f"Lecture de {fichier.name}..."):
-                nb = rag.ajouter_document(user_id, fichier)
-            st.session_state.fichiers_ajoutes.append(fichier.name)
+                nb = rag.ajouter_document(user_id, fichier, project_id=projet_id)
+            st.session_state.fichiers_ajoutes.append(cle_fichier)
             st.success(f"{fichier.name} : {nb} morceaux ajoutés")
 
-    nb_total = rag.nombre_morceaux(user_id)
+    nb_total = rag.nombre_morceaux(user_id, project_id=projet_id)
     if nb_total > 0:
-        st.info(f"📚 {nb_total} morceaux dans ta base")
-        if st.button("🗑 Vider mes documents", use_container_width=True):
-            rag.supprimer_documents(user_id)
-            st.session_state.fichiers_ajoutes = []
+        st.info(f"📚 {nb_total} morceaux dans {'ce projet' if projet_id else 'ta base'}")
+        if st.button("🗑 Vider ces documents", use_container_width=True):
+            rag.supprimer_documents(user_id, project_id=projet_id)
+            st.session_state.fichiers_ajoutes = [
+                f for f in st.session_state.fichiers_ajoutes
+                if not f.startswith(f"{projet_id or 'general'}:")
+            ]
             st.rerun()
     else:
         st.info("Aucun document chargé")
+
+if projet_id:
+    st.info(f"📁 Projet : **{projet_nom}**")
 
 # --- Afficher les anciens messages (depuis SQLite) ---
 conv_id = st.session_state.conv_id
@@ -373,15 +451,23 @@ if question:
                     historique = convertir_historique(db.get_messages(conv_id))
 
                     # RAG : on cherche les morceaux utiles dans les documents
-                    morceaux = rag.chercher(user_id, question)
+                    # (ceux du projet si on est dans un projet, sinon les généraux)
+                    morceaux = rag.chercher(user_id, question, project_id=projet_id)
+                    consignes = []
+                    if projet_id:
+                        consignes.append(
+                            f"Tu aides l'utilisateur dans son projet « {projet_nom} »."
+                        )
                     if morceaux:
                         contexte = "\n\n".join(morceaux)
-                        systeme = {
-                            "role": "system",
-                            "content": "Réponds en utilisant ces extraits de documents "
-                            "si c'est utile :\n\n" + contexte,
-                        }
-                        historique = [systeme] + historique
+                        consignes.append(
+                            "Réponds en utilisant ces extraits de documents "
+                            "si c'est utile :\n\n" + contexte
+                        )
+                    if consignes:
+                        historique = [
+                            {"role": "system", "content": "\n\n".join(consignes)}
+                        ] + historique
 
                     response = client.chat.completions.create(
                         model=MODEL,

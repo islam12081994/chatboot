@@ -13,10 +13,18 @@ embedding = embedding_functions.SentenceTransformerEmbeddingFunction(
 client = chromadb.PersistentClient(path="chroma_db")
 
 
-def get_collection(user_id):
-    """Chaque utilisateur a sa propre collection (ses propres documents)."""
+def nom_collection(user_id, project_id=None):
+    """Conversations générales : documents de l'utilisateur.
+    Projet : documents propres à ce projet."""
+    if project_id is None:
+        return f"user_{user_id}"
+    return f"project_{project_id}"
+
+
+def get_collection(user_id, project_id=None):
+    """Chaque utilisateur (et chaque projet) a sa propre collection de documents."""
     return client.get_or_create_collection(
-        name=f"user_{user_id}",
+        name=nom_collection(user_id, project_id),
         embedding_function=embedding,
     )
 
@@ -44,13 +52,13 @@ def decouper_texte(texte, taille=500):
 
 
 # 4) Ajouter un document dans ChromaDB
-def ajouter_document(user_id, fichier):
+def ajouter_document(user_id, fichier, project_id=None):
     texte = lire_fichier(fichier)
     morceaux = decouper_texte(texte)
     if not morceaux:
         return 0
 
-    collection = get_collection(user_id)
+    collection = get_collection(user_id, project_id)
     ids = [f"{fichier.name}_{i}" for i in range(len(morceaux))]
     collection.upsert(
         ids=ids,
@@ -61,8 +69,8 @@ def ajouter_document(user_id, fichier):
 
 
 # 5) Chercher les morceaux les plus proches de la question
-def chercher(user_id, question, n=3):
-    collection = get_collection(user_id)
+def chercher(user_id, question, n=3, project_id=None):
+    collection = get_collection(user_id, project_id)
     if collection.count() == 0:
         return []
     resultats = collection.query(
@@ -72,11 +80,14 @@ def chercher(user_id, question, n=3):
     return resultats["documents"][0]
 
 
-# 6) Nombre de morceaux enregistrés pour l'utilisateur
-def nombre_morceaux(user_id):
-    return get_collection(user_id).count()
+# 6) Nombre de morceaux enregistrés (général ou d'un projet)
+def nombre_morceaux(user_id, project_id=None):
+    return get_collection(user_id, project_id).count()
 
 
-# 7) Supprimer tous les documents de l'utilisateur
-def supprimer_documents(user_id):
-    client.delete_collection(name=f"user_{user_id}")
+# 7) Supprimer tous les documents (généraux ou d'un projet)
+def supprimer_documents(user_id, project_id=None):
+    try:
+        client.delete_collection(name=nom_collection(user_id, project_id))
+    except Exception:
+        pass  # la collection n'existe pas encore : rien à supprimer
